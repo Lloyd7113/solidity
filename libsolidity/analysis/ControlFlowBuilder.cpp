@@ -16,6 +16,7 @@
 */
 
 #include <libsolidity/analysis/ControlFlowBuilder.h>
+#include <libyul/AsmData.h>
 
 using namespace solidity;
 using namespace solidity::langutil;
@@ -29,6 +30,7 @@ ControlFlowBuilder::ControlFlowBuilder(CFG::NodeContainer& _nodeContainer, Funct
 	m_revertNode(_functionFlow.revert)
 {
 }
+
 
 unique_ptr<FunctionFlow> ControlFlowBuilder::createFunctionFlow(
 	CFG::NodeContainer& _nodeContainer,
@@ -315,8 +317,7 @@ bool ControlFlowBuilder::visit(FunctionDefinition const& _functionDefinition)
 		appendControlFlow(*returnParameter);
 		m_returnNode->variableOccurrences.emplace_back(
 			*returnParameter,
-			VariableOccurrence::Kind::Return,
-			nullptr
+			VariableOccurrence::Kind::Return
 		);
 
 	}
@@ -345,7 +346,7 @@ bool ControlFlowBuilder::visit(Return const& _return)
 			m_currentNode->variableOccurrences.emplace_back(
 				*returnParameter,
 				VariableOccurrence::Kind::Assignment,
-				&_return
+				_return.location()
 			);
 	}
 	connect(m_currentNode, m_returnNode);
@@ -363,18 +364,151 @@ bool ControlFlowBuilder::visit(FunctionTypeName const& _functionTypeName)
 
 bool ControlFlowBuilder::visit(InlineAssembly const& _inlineAssembly)
 {
-	solAssert(!!m_currentNode, "");
-	visitNode(_inlineAssembly);
-	for (auto const& ref: _inlineAssembly.annotation().externalReferences)
+	solAssert(!!m_currentNode && !m_inlineAssemblyAnnotation, "");
+
+	m_inlineAssemblyAnnotation = &_inlineAssembly.annotation();
+	(*this)(_inlineAssembly.operations());
+	m_inlineAssemblyAnnotation = nullptr;
+
+	return false;
+}
+
+void ControlFlowBuilder::visit(yul::Statement const& _statement)
+{
+	solAssert(m_currentNode && m_inlineAssemblyAnnotation, "");
+	m_currentNode->location = langutil::SourceLocation::smallestCovering(m_currentNode->location, locationOf(_statement));
+	ASTWalker::visit(_statement);
+}
+
+void ControlFlowBuilder::operator()(yul::If const& _if)
+{
+	solAssert(m_currentNode && m_inlineAssemblyAnnotation, "");
+	visit(*_if.condition);
+
+	auto nodes = splitFlow<2>();
+	m_currentNode = nodes[0];
+	(*this)(_if.body);
+	nodes[0] = m_currentNode;
+	mergeFlow(nodes, nodes[1]);
+}
+
+void ControlFlowBuilder::operator()(yul::Switch const& _switch)
+{
+	solAssert(m_currentNode && m_inlineAssemblyAnnotation, "");
+	visit(*_switch.expression);
+
+	bool hasDefault = util::contains_if(_switch.cases, [](yul::Case const& _case) { return !_case.value; });
+	auto beforeSwitch = m_currentNode;
+
+	auto nodes = splitFlow(_switch.cases.size());
+	for (size_t i = 0u; i < _switch.cases.size(); ++i)
 	{
-		if (auto variableDeclaration = dynamic_cast<VariableDeclaration const*>(ref.second.declaration))
+		m_currentNode = nodes[i];
+		(*this)(_switch.cases[i].body);
+		nodes[i] = m_currentNode;
+	}
+	mergeFlow(nodes);
+
+	if (!hasDefault)
+		connect(beforeSwitch, m_currentNode);
+}
+
+void ControlFlowBuilder::operator()(yul::ForLoop const& _forLoop)
+{
+	solAssert(m_currentNode && m_inlineAssemblyAnnotation, "");
+
+	(*this)(_forLoop.pre);
+
+	auto condition = createLabelHere();
+
+	if (_forLoop.condition)
+		visit(*_forLoop.condition);
+
+	auto loopExpression = newLabel();
+	auto nodes = splitFlow<2>();
+	auto afterFor = nodes[1];
+	m_currentNode = nodes[0];
+
+	{
+		BreakContinueScope scope(*this, afterFor, loopExpression);
+		(*this)(_forLoop.body);
+	}
+
+	placeAndConnectLabel(loopExpression);
+
+	(*this)(_forLoop.post);
+
+	connect(m_currentNode, condition);
+	m_currentNode = afterFor;
+}
+
+void ControlFlowBuilder::operator()(yul::Break const&)
+{
+	solAssert(m_currentNode && m_inlineAssemblyAnnotation, "");
+	solAssert(m_breakJump, "");
+	connect(m_currentNode, m_breakJump);
+	m_currentNode = newLabel();
+}
+
+void ControlFlowBuilder::operator()(yul::Continue const&)
+{
+	solAssert(m_currentNode && m_inlineAssemblyAnnotation, "");
+	solAssert(m_continueJump, "");
+	connect(m_currentNode, m_continueJump);
+	m_currentNode = newLabel();
+}
+
+void ControlFlowBuilder::operator()(yul::Identifier const& _identifier)
+{
+	solAssert(m_currentNode && m_inlineAssemblyAnnotation, "");
+	if (m_inlineAssemblyAnnotation->externalReferences.count(&_identifier))
+	{
+		if (auto const* declaration = dynamic_cast<VariableDeclaration const*>(m_inlineAssemblyAnnotation->externalReferences.at(&_identifier).declaration))
 			m_currentNode->variableOccurrences.emplace_back(
-				*variableDeclaration,
-				VariableOccurrence::Kind::InlineAssembly,
-				&_inlineAssembly
+				*declaration,
+				VariableOccurrence::Kind::Access,
+				_identifier.location
 			);
 	}
-	return true;
+}
+
+void ControlFlowBuilder::operator()(yul::Assignment const& _assignment)
+{
+	solAssert(m_currentNode && m_inlineAssemblyAnnotation, "");
+	visit(*_assignment.value);
+	for (auto const& variable: _assignment.variableNames)
+		if (m_inlineAssemblyAnnotation->externalReferences.count(&variable))
+			if (auto const* declaration = dynamic_cast<VariableDeclaration const*>(m_inlineAssemblyAnnotation->externalReferences.at(&variable).declaration))
+				m_currentNode->variableOccurrences.emplace_back(
+					*declaration,
+					VariableOccurrence::Kind::Assignment,
+					variable.location
+				);
+}
+
+void ControlFlowBuilder::operator()(yul::FunctionCall const& _functionCall)
+{
+	using namespace yul;
+	solAssert(m_currentNode && m_inlineAssemblyAnnotation, "");
+	yul::ASTWalker::operator()(_functionCall);
+	if (_functionCall.functionName.name == "revert"_yulstring)
+	{
+		connect(m_currentNode, m_revertNode);
+		m_currentNode = newLabel();
+	}
+	else if (_functionCall.functionName.name == "return"_yulstring)
+	{
+		// TODO: how to handle return data? When to consider storage return variables as being assigned to and when not?
+		connect(m_currentNode, m_returnNode);
+		m_currentNode = newLabel();
+	}
+}
+
+void ControlFlowBuilder::operator()(yul::FunctionDefinition const&)
+{
+	solAssert(m_currentNode && m_inlineAssemblyAnnotation, "");
+	// External references cannot be accessed from within functions, so we can ignore their control flow.
+	// TODO: we might still want to track if they always revert or return, though.
 }
 
 bool ControlFlowBuilder::visit(VariableDeclaration const& _variableDeclaration)
@@ -384,8 +518,7 @@ bool ControlFlowBuilder::visit(VariableDeclaration const& _variableDeclaration)
 
 	m_currentNode->variableOccurrences.emplace_back(
 		_variableDeclaration,
-		VariableOccurrence::Kind::Declaration,
-		nullptr
+		VariableOccurrence::Kind::Declaration
 	);
 
 	// Handle declaration with immediate assignment.
@@ -393,14 +526,13 @@ bool ControlFlowBuilder::visit(VariableDeclaration const& _variableDeclaration)
 		m_currentNode->variableOccurrences.emplace_back(
 			_variableDeclaration,
 			VariableOccurrence::Kind::Assignment,
-			_variableDeclaration.value().get()
+			_variableDeclaration.value()->location()
 		);
 	// Function arguments are considered to be immediately assigned as well (they are "externally assigned").
 	else if (_variableDeclaration.isCallableOrCatchParameter() && !_variableDeclaration.isReturnParameter())
 		m_currentNode->variableOccurrences.emplace_back(
 			_variableDeclaration,
-			VariableOccurrence::Kind::Assignment,
-			nullptr
+			VariableOccurrence::Kind::Assignment
 		);
 	return true;
 }
@@ -434,7 +566,7 @@ bool ControlFlowBuilder::visit(VariableDeclarationStatement const& _variableDecl
 				m_currentNode->variableOccurrences.emplace_back(
 					*var,
 					VariableOccurrence::Kind::Assignment,
-					expression
+					expression ? std::make_optional(expression->location()) : std::optional<langutil::SourceLocation>{}
 				);
 			}
 	}
@@ -452,7 +584,7 @@ bool ControlFlowBuilder::visit(Identifier const& _identifier)
 			static_cast<Expression const&>(_identifier).annotation().lValueRequested ?
 			VariableOccurrence::Kind::Assignment :
 			VariableOccurrence::Kind::Access,
-			&_identifier
+			_identifier.location()
 		);
 
 	return true;

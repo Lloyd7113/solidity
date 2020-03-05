@@ -137,7 +137,7 @@ void ControlFlowAnalyzer::checkUninitializedAccess(CFGNode const* _entry, CFGNod
 
 			m_errorReporter.typeError(
 				variableOccurrence->occurrence() ?
-					variableOccurrence->occurrence()->location() :
+					*variableOccurrence->occurrence() :
 					variableOccurrence->declaration().location(),
 				ssl,
 				string("This variable is of storage pointer type and can be ") +
